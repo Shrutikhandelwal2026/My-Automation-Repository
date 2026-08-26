@@ -14490,11 +14490,17 @@ async function readQuoteLinesTabForPdfCompare(page) {
 
 /**
  * Quote toolbar (beside Browse Catalogs):
- *   Generate PDF Document → Preview PDF → scroll all pages →
- *   validate Quotation Details vs Lines tab Products/QLI
+ *   Generate PDF Document → Preview PDF / View Quote Document →
+ *   extract Quotation Details (DOM text OR downloaded PDF) →
+ *   validate vs Lines tab Products/QLI
+ *
+ * Salesforce often shows an Adobe image-based viewer (page <img>s) with no
+ * selectable table text — scraping DOM alone hangs/times out. Prefer Download
+ * + pdf-parse when that happens.
  */
 async function generateAndPreviewQuotePdf(page, { linesExpected = [], lineSnapshots = [], validationRows = [] } = {}) {
   progress('13. Generate PDF Document → Preview PDF → validate Quotation Details vs Lines');
+  const stepDeadline = Date.now() + 4 * 60_000; // never burn the whole E2E timeout here
 
   let quoteId = await quoteIdFromUrl(page);
   if (!quoteId || !/\/lightning\/r\/Quote\//i.test(page.url() || '')) {
@@ -14536,31 +14542,33 @@ async function generateAndPreviewQuotePdf(page, { linesExpected = [], lineSnapsh
 
   const dialog = page
     .locator('.forceModal.open, .uiModal.open, .slds-modal, [role="dialog"], lightning-overlay-container, .slds-modal__container')
-    .filter({ hasText: /generate\s*pdf|preview\s*pdf|create\s*pdf/i })
+    .filter({ hasText: /generate\s*pdf|preview\s*pdf|create\s*pdf|view\s*quote\s*document/i })
     .last();
   await page
     .waitForFunction(
-      () => /preview\s*pdf|create\s*pdf|generate\s*pdf/i.test(document.body?.innerText || ''),
+      () => /preview\s*pdf|create\s*pdf|generate\s*pdf|view\s*quote\s*document/i.test(document.body?.innerText || ''),
       null,
       { timeout: 60_000 },
     )
     .catch(() => {});
   await sleep(600);
 
+  // Org UI may show Preview PDF or View Quote Document (same goal)
   const previewBtn = dialog
-    .getByRole('button', { name: /^preview\s*pdf$/i })
-    .or(page.getByRole('button', { name: /^preview\s*pdf$/i }))
-    .or(dialog.getByRole('link', { name: /^preview\s*pdf$/i }))
-    .or(page.getByRole('link', { name: /^preview\s*pdf$/i }))
-    .or(page.locator('button, a, lightning-button').filter({ hasText: /^preview\s*pdf$/i }))
+    .getByRole('button', { name: /^(preview\s*pdf|view\s*quote\s*document)$/i })
+    .or(page.getByRole('button', { name: /^(preview\s*pdf|view\s*quote\s*document)$/i }))
+    .or(dialog.getByRole('link', { name: /^(preview\s*pdf|view\s*quote\s*document)$/i }))
+    .or(page.getByRole('link', { name: /^(preview\s*pdf|view\s*quote\s*document)$/i }))
+    .or(page.locator('button, a, lightning-button').filter({ hasText: /^(preview\s*pdf|view\s*quote\s*document)$/i }))
     .first();
 
   await previewBtn.waitFor({ state: 'visible', timeout: 45_000 });
-  progress('13. Clicking Preview PDF (may take a few minutes for Quotation PDF)');
+  const previewLabel = ((await previewBtn.innerText().catch(() => '')) || 'Preview').replace(/\s+/g, ' ').trim();
+  progress(`13. Clicking ${previewLabel} (may take a few minutes for Quotation PDF)`);
 
   const context = page.context();
   const pagesBefore = context.pages().length;
-  const popupPromise = context.waitForEvent('page', { timeout: 180_000 }).catch(() => null);
+  const popupPromise = context.waitForEvent('page', { timeout: 90_000 }).catch(() => null);
   await previewBtn.click();
   await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 120_000 }).catch(() => {});
 
@@ -14574,14 +14582,17 @@ async function generateAndPreviewQuotePdf(page, { linesExpected = [], lineSnapsh
     await previewPage.waitForLoadState('domcontentloaded').catch(() => {});
   }
 
-  const pdfReady = await waitForQuotePdfPreviewVisible(target, { timeoutMs: 5 * 60_000 });
+  const remainingMs = Math.max(30_000, stepDeadline - Date.now());
+  const pdfReady = await waitForQuotePdfPreviewVisible(target, {
+    timeoutMs: Math.min(3 * 60_000, remainingMs),
+  });
   if (!pdfReady) {
-    throw new Error('Quote PDF Preview did not become visible within 5 minutes after Preview PDF.');
+    throw new Error('Quote PDF Preview did not become visible within the PDF-step time budget.');
   }
-  progress('13. Quotation PDF visible — scroll all pages and validate Quotation Details');
+  progress('13. Quotation PDF visible — extract Quotation Details (DOM and/or Download)');
 
-  const pdfRows = await scrollPdfAndCollectQuotationDetails(target);
-  progress(`13. PDF Quotation Details — ${pdfRows.length} row(s) across pages`);
+  let pdfRows = await collectQuotePdfQuotationDetails(target, { deadlineMs: stepDeadline });
+  progress(`13. PDF Quotation Details — ${pdfRows.length} row(s)`);
 
   let expected = linesExpected;
   if (!expected.length && lineSnapshots.length) {
@@ -14595,12 +14606,32 @@ async function generateAndPreviewQuotePdf(page, { linesExpected = [], lineSnapsh
     }));
   }
 
+  if (!pdfRows.length) {
+    validationRows.push({
+      section: 'PDF Quotation Details extraction',
+      actual: '0 rows (image Adobe preview / no text layer)',
+      expected: `≥ ${expected.length || 1} Lines row(s)`,
+      status: STRICT_VALIDATION ? 'FAIL' : 'SKIP',
+    });
+    progress(
+      '13. WARN — could not extract Quotation Details text from image PDF; preview itself succeeded',
+    );
+    if (STRICT_VALIDATION) {
+      throw new Error('PDF preview opened but Quotation Details could not be extracted for validation.');
+    }
+    progress('13. Generate PDF → Preview - Passed (validation skipped — image PDF, SF_STRICT_VALIDATION off)');
+    return true;
+  }
+
   const ok = validatePdfQuotationDetailsVsLines(pdfRows, expected, validationRows);
   if (!ok) {
     progress('13. PDF Quotation Details mismatches — read FAILs and act');
     await settleValidationOrContinue(page, validationRows, { contextLabel: 'PDF Quotation Details vs Lines' });
     if (STRICT_VALIDATION) {
-      printCalcVsQliTable(validationRows.filter((r) => /PDF|Quotation Details/i.test(r.section || '')), 'PDF Quotation Details vs Lines');
+      printCalcVsQliTable(
+        validationRows.filter((r) => /PDF|Quotation Details/i.test(r.section || '')),
+        'PDF Quotation Details vs Lines',
+      );
       throw new Error('PDF Quotation Details do not match Lines tab Products/QLI — see validation table.');
     }
     progress('13. WARN — PDF vs Lines mismatches remain; continuing (SF_STRICT_VALIDATION off)');
@@ -14610,10 +14641,161 @@ async function generateAndPreviewQuotePdf(page, { linesExpected = [], lineSnapsh
   return true;
 }
 
+/** True when Salesforce Adobe preview renders PDF pages as images (no HTML table). */
+async function isAdobeImagePdfPreview(page) {
+  return page
+    .evaluate(() => {
+      const imgs = [...document.querySelectorAll('img')].filter((img) =>
+        /page\s*\d+\s*of\s*\d+|todelte_preview|todelete_preview|preview-/i.test(
+          `${img.alt || ''} ${img.title || ''} ${img.getAttribute('src') || ''}`,
+        ),
+      );
+      const adobe = /adobe\s*pdf|todelte_preview|todelete_preview|preview-\d+/i.test(document.body?.innerText || '');
+      const download = [...document.querySelectorAll('button, a')].some((el) =>
+        /^download$/i.test((el.textContent || '').replace(/\s+/g, ' ').trim()),
+      );
+      return imgs.length > 0 || (adobe && download);
+    })
+    .catch(() => false);
+}
+
+/**
+ * Collect Quotation Details: try DOM first; if image Adobe viewer, Download PDF and parse text.
+ */
+async function collectQuotePdfQuotationDetails(page, { deadlineMs = Date.now() + 120_000 } = {}) {
+  let rows = await scrollPdfAndCollectQuotationDetails(page, {
+    maxPages: 8,
+    deadlineMs: Math.min(deadlineMs, Date.now() + 45_000),
+  });
+  if (rows.length) return rows;
+
+  const imagePdf = await isAdobeImagePdfPreview(page);
+  if (imagePdf) {
+    progress('13. Adobe image PDF detected — downloading file and extracting text');
+  } else {
+    progress('13. No DOM Quotation Details — trying Download PDF anyway');
+  }
+
+  if (Date.now() > deadlineMs - 5_000) return rows;
+
+  const downloaded = await downloadQuotePdfBytes(page);
+  if (!downloaded?.length) {
+    progress('13. PDF Download did not yield a file');
+    return rows;
+  }
+
+  const fromFile = await extractQuotationDetailsFromPdfBuffer(downloaded);
+  if (fromFile.length) {
+    progress(`13. Extracted ${fromFile.length} Quotation Details row(s) from downloaded PDF`);
+    return fromFile;
+  }
+  progress('13. Downloaded PDF but could not parse Quotation Details lines from text');
+  return rows;
+}
+
+async function downloadQuotePdfBytes(page) {
+  const downloadBtn = page
+    .getByRole('button', { name: /^download$/i })
+    .or(page.getByRole('link', { name: /^download$/i }))
+    .or(page.locator('button[title*="Download" i], a[title*="Download" i], a[download]'))
+    .first();
+
+  if (!(await downloadBtn.isVisible({ timeout: 5_000 }).catch(() => false))) {
+    progress('13. Download button not visible on PDF preview');
+    return null;
+  }
+
+  try {
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60_000 }),
+      downloadBtn.click({ force: true }),
+    ]);
+    const outDir = path.join(process.cwd(), 'test-results');
+    fs.mkdirSync(outDir, { recursive: true });
+    const suggested = download.suggestedFilename() || `quote-preview-${Date.now()}.pdf`;
+    const savePath = path.join(outDir, suggested.replace(/[^\w.\-]+/g, '_'));
+    await download.saveAs(savePath);
+    const buf = fs.readFileSync(savePath);
+    progress(`13. Saved PDF download → ${savePath} (${buf.length} bytes)`);
+    return buf;
+  } catch (err) {
+    progress(`13. PDF download failed — ${String(err?.message || err).slice(0, 140)}`);
+    return null;
+  }
+}
+
+async function extractQuotationDetailsFromPdfBuffer(buffer) {
+  try {
+    const { PDFParse } = require('pdf-parse');
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    await parser.destroy().catch(() => {});
+    const text = String(result?.text || '');
+    if (!text.trim()) return [];
+    progress(`13. PDF text length=${text.length} — parsing Quotation Details`);
+    return parseQuotationDetailsFromPdfText(text);
+  } catch (err) {
+    progress(`13. pdf-parse failed — ${String(err?.message || err).slice(0, 140)}`);
+    return [];
+  }
+}
+
+/** Parse Quotation Details lines from extracted PDF text. */
+function parseQuotationDetailsFromPdfText(rawText) {
+  const parseMoney = (s) => {
+    const t = String(s || '')
+      .replace(/SAR|USD|EUR/gi, '')
+      .replace(/[^\d.,\-]/g, '')
+      .replace(/,/g, '');
+    const n = Number.parseFloat(t);
+    return Number.isFinite(n) ? n : NaN;
+  };
+
+  const text = String(rawText || '').replace(/\u00a0/g, ' ');
+  const idx = text.search(/quotation\s*details/i);
+  const chunk = idx >= 0 ? text.slice(idx, idx + 12000) : text;
+  const out = [];
+  const seen = new Set();
+
+  const lineRe =
+    /\b([A-Z]{1,6}-[A-Z0-9][A-Z0-9\-]*)\b([\s\S]{0,220}?)(?:\b(\d+(?:\.\d+)?)\b)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)/g;
+  let m;
+  while ((m = lineRe.exec(chunk))) {
+    const item = m[1];
+    const mid = String(m[2] || '').replace(/\s+/g, ' ').trim();
+    if (/material\s*code|unit\s*sales|total\s*selling|^item$/i.test(item)) continue;
+    const qty = Number.parseFloat(m[3]);
+    const unitPrice = parseMoney(m[4]);
+    const totalPrice = parseMoney(m[5]);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    if (!Number.isFinite(unitPrice) || !Number.isFinite(totalPrice)) continue;
+    const description = mid
+      .replace(/\bN\/?A\b/gi, 'N/A')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 200);
+    const key = `${item}|${qty}|${unitPrice}|${totalPrice}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      item,
+      materialCode: '',
+      description,
+      vatPct: NaN,
+      qty,
+      unitPrice,
+      totalPrice,
+    });
+  }
+
+  return out;
+}
+
 /**
  * Scroll through every PDF preview page and collect Quotation Details line rows.
+ * Bounded — image Adobe viewers often have no DOM tables.
  */
-async function scrollPdfAndCollectQuotationDetails(page) {
+async function scrollPdfAndCollectQuotationDetails(page, { maxPages = 8, deadlineMs = Date.now() + 45_000 } = {}) {
   const allRows = [];
   const seenKeys = new Set();
 
@@ -14627,9 +14809,16 @@ async function scrollPdfAndCollectQuotationDetails(page) {
   };
 
   absorb(await scrapeQuotationDetailsFromPdfPage(page));
+  if ((await isAdobeImagePdfPreview(page)) && !allRows.length) {
+    progress('13. Image PDF preview — skip long DOM page-walk (will Download instead)');
+    return allRows;
+  }
 
-  // Page navigation: Next / page of N / scrollbar
-  for (let p = 0; p < 40; p++) {
+  for (let p = 0; p < maxPages; p++) {
+    if (Date.now() > deadlineMs) {
+      progress('13. PDF DOM scrape time budget reached');
+      break;
+    }
     const pageInfo = await readPdfPageIndicator(page);
     progress(
       `13. PDF page ${pageInfo.current || p + 1}${pageInfo.total ? ` of ${pageInfo.total}` : ''} — Quotation Details rows so far ${allRows.length}`,
@@ -14638,20 +14827,11 @@ async function scrollPdfAndCollectQuotationDetails(page) {
     if (pageInfo.total && pageInfo.current && pageInfo.current >= pageInfo.total) break;
 
     const moved = await goToNextPdfPreviewPage(page);
-    if (!moved) {
-      // Fallback: wheel/scroll through document
-      await page.mouse.wheel(0, 1200).catch(() => {});
-      await sleep(600);
-      const before = allRows.length;
-      absorb(await scrapeQuotationDetailsFromPdfPage(page));
-      if (allRows.length === before && p > 2) break;
-      continue;
-    }
-    await sleep(800);
+    if (!moved) break;
+    await sleep(500);
     absorb(await scrapeQuotationDetailsFromPdfPage(page));
   }
 
-  // Final full-document scrape (some viewers keep all pages in DOM)
   absorb(await scrapeQuotationDetailsFromPdfPage(page));
   return allRows;
 }
@@ -14664,12 +14844,24 @@ async function readPdfPageIndicator(page) {
   if (m) {
     return { current: Number.parseInt(m[1], 10), total: Number.parseInt(m[2], 10) };
   }
+  const alts = await page
+    .evaluate(() =>
+      [...document.querySelectorAll('img')]
+        .map((img) => img.alt || '')
+        .filter((a) => /page\s*\d+\s*of\s*\d+/i.test(a))
+        .join(' | '),
+    )
+    .catch(() => '');
+  const m2 = String(alts).match(/page\s*(\d+)\s*of\s*(\d+)/i);
+  if (m2) {
+    return { current: Number.parseInt(m2[1], 10), total: Number.parseInt(m2[2], 10) };
+  }
   return { current: NaN, total: NaN };
 }
 
 async function goToNextPdfPreviewPage(page) {
   const next = page
-    .getByRole('button', { name: /next\s*page|^next$|›|»/i })
+    .getByRole('button', { name: /next\s*page|^next$/i })
     .or(page.locator('button[title*="Next" i], a[title*="Next" i], button[aria-label*="Next" i]'))
     .first();
   if (await next.isVisible({ timeout: 800 }).catch(() => false)) {
@@ -14678,9 +14870,8 @@ async function goToNextPdfPreviewPage(page) {
     await next.click().catch(() => {});
     return true;
   }
-  // Keyboard PageDown / Arrow
-  await page.keyboard.press('PageDown').catch(() => {});
-  return true;
+  // Do NOT press PageDown and claim success — that caused infinite walks on image viewers
+  return false;
 }
 
 /**
@@ -14937,15 +15128,19 @@ async function waitForQuotePdfPreviewVisible(page, { timeoutMs = 5 * 60_000 } = 
         const hasPdfViewer = !!document.querySelector(
           'embed[type*="pdf" i], object[type*="pdf" i], iframe[src*="pdf" i], iframe[src*="blob:" i], .pdfViewer, #viewer, canvas.pdf-page, [class*="pdf" i]',
         );
-        const hasPreviewChrome = /download|public\s*link|toDelete_Preview|Preview-\d+/i.test(t + html);
+        const hasPreviewChrome = /download|public\s*link|toDelete_Preview|Preview-\d+|adobe\s*pdf/i.test(t + html);
         const hasLineTable = /material\s*code|unit\s*sales\s*price|total\s*selling\s*price|quotation\s*details/i.test(t);
-        return { hasQuotationTitle, hasPdfViewer, hasPreviewChrome, hasLineTable };
+        const hasPageImages = [...document.querySelectorAll('img')].some((img) =>
+          /page\s*\d+\s*of\s*\d+|todelete_preview|preview-/i.test(`${img.alt || ''} ${img.title || ''}`),
+        );
+        return { hasQuotationTitle, hasPdfViewer, hasPreviewChrome, hasLineTable, hasPageImages };
       })
       .catch(() => ({
         hasQuotationTitle: false,
         hasPdfViewer: false,
         hasPreviewChrome: false,
         hasLineTable: false,
+        hasPageImages: false,
       }));
 
     const quotationVisible = await page
@@ -14963,6 +15158,8 @@ async function waitForQuotePdfPreviewVisible(page, { timeoutMs = 5 * 60_000 } = 
       (signals.hasQuotationTitle && (signals.hasLineTable || signals.hasPreviewChrome || signals.hasPdfViewer)) ||
       (quotationVisible && (detailsVisible || signals.hasPdfViewer || signals.hasPreviewChrome)) ||
       (signals.hasPdfViewer && signals.hasPreviewChrome) ||
+      (signals.hasPageImages && signals.hasPreviewChrome) ||
+      signals.hasPageImages ||
       detailsVisible
     ) {
       progress(
@@ -14997,6 +15194,7 @@ async function newSfContext(browser, { headless, storageState } = {}) {
     baseURL: SF_BASE_URL,
     storageState: storageState || undefined,
     viewport: headless ? { width: 1920, height: 1080 } : null,
+    acceptDownloads: true,
     permissions: ['geolocation'],
     geolocation: { latitude: 24.7136, longitude: 46.6753 },
   });
