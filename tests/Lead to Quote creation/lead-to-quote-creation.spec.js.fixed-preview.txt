@@ -1,0 +1,12 @@
+/**
+ * Salesforce Login
+ *   → Lead → Create Lead → Open & Qualify Lead → Convert Lead
+ *   → Contact (fill) → Account via Customer Name (fill)
+ *   → Account Related → Opportunity (fill)
+ *   → Opportunity Related → Price Book → Add Products → Create Quote
+ *
+ * After Convert the Lead record is gone. Account RT: Sold To Party.
+ * Opportunity RT from Product Category (Consumables / Medical Equipment).
+ *
+ * Field types: text/textarea, email, phone, picklist, multi-select, checkbox,
+ *

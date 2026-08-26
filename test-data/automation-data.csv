@@ -1,0 +1,3 @@
+scenario,username,password,homePath,notes
+smoke,skhandelwal@horizontal.com.tibbiyah.qa,YOUR_PASSWORD,/lightning/page/home,Primary QA user — replace YOUR_PASSWORD before run.
+regression,skhandelwal@horizontal.com.tibbiyah.qa,YOUR_PASSWORD_REGRESSION,/lightning/page/home,Second scenario — set TEST_SCENARIO=regression to use this row; replace password placeholder.

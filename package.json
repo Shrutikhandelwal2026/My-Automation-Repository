@@ -1,0 +1,21 @@
+{
+  "name": "tibbiyah-automation",
+  "version": "1.0.0",
+  "description": "Tibbiyah Automation",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "codegen": "playwright codegen https://tibbiyah--qa.sandbox.lightning.force.com/lightning/page/home",
+    "record:auth": "playwright codegen --save-storage=auth.json https://tibbiyah--qa.sandbox.lightning.force.com/lightning/page/home"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "csv-parse": "^6.2.1"
+  }
+}
