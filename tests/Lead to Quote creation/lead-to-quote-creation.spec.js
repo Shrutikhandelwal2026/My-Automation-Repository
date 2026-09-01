@@ -33,6 +33,7 @@
  *           SF_SKIP_QUOTE=1,
  *           SF_STOP_AFTER_CONVERT=1 (stop after Lead Convert; skip Acc/Contact/Opp fill + Quote),
  *           SF_QUOTE_ID=0Q0… (resume Quote → Lines → Configure pricing → validate → PDF),
+ *           SF_PDF_ONLY=1 (with SF_QUOTE_ID — Generate PDF → Preview only, skip calculator),
  *           SF_REUSE_LEAD=1 + SF_LEAD_ID=00Q… (opt-in only — default is always New Lead),
  *           SF_OPP_ID=006… (resume: skip Lead/Convert; fill Opp → Price Book → Products → Quote),
  *           One Quote per Opportunity — never create a second; open existing if Quotes (n) ≥ 1.
@@ -115,6 +116,8 @@ const REUSE_LEAD = /^(1|true|yes)$/i.test(process.env.SF_REUSE_LEAD || '');
 const EXISTING_LEAD_ID = REUSE_LEAD ? (process.env.SF_LEAD_ID || '').trim() : '';
 const RESUME_OPP_ID = (process.env.SF_OPP_ID || process.env.SF_RESUME_OPP_ID || '').trim();
 const RESUME_QUOTE_ID = (process.env.SF_QUOTE_ID || process.env.SF_RESUME_QUOTE_ID || '').trim();
+/** With SF_QUOTE_ID: skip calculator/QLI loops and run Generate PDF → Preview only. */
+const PDF_ONLY = /^(1|true|yes)$/i.test(process.env.SF_PDF_ONLY || '');
 /** Ignored: one Quote per Opp — always open existing when Quotes (n) ≥ 1. */
 const FORCE_NEW_QUOTE = /^(1|true|yes)$/i.test(process.env.SF_FORCE_NEW_QUOTE || '');
 /**
@@ -7328,6 +7331,34 @@ async function clickQuoteStalePriceRefresh(page, { timeout = 45_000 } = {}) {
   return true;
 }
 
+/**
+ * Always refresh the Quote record after Pricing Calculator Save so QLI values sync.
+ * Tries toolbar Refresh; falls back to page reload.
+ */
+async function refreshQuoteRecord(page) {
+  if (!/\/lightning\/r\/Quote\//i.test(page.url() || '')) return false;
+  progress('12. Quote record — Refresh after Calculator Save (sync line values)');
+  await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
+  await clickQuoteStalePriceRefresh(page, { timeout: 3_000 }).catch(() => {});
+
+  const refreshBtn = page
+    .getByRole('button', { name: /^refresh$/i })
+    .or(page.locator('button[title="Refresh"], button[name="refreshButton"], lightning-button-icon[title="Refresh"]'))
+    .first();
+  if (await refreshBtn.isVisible({ timeout: 4_000 }).catch(() => false)) {
+    await refreshBtn.click();
+  } else {
+    const url = page.url();
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    if (url) await page.waitForURL(/\/lightning\/r\/Quote\//i, { timeout: 45_000 }).catch(() => {});
+  }
+  await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 60_000 }).catch(() => {});
+  await waitForQuoteRecordVisible(page, { timeout: 45_000 }).catch(() => {});
+  await clickQuoteStalePriceRefresh(page, { timeout: 8_000 }).catch(() => {});
+  progress('12. Quote record Refresh done');
+  return true;
+}
+
 /** Related → Quotes: open newest existing quote. Never clicks New Quote. */
 async function openExistingQuoteFromRelated(page, { preferName = '' } = {}) {
   await openRelatedTab(page);
@@ -8047,6 +8078,14 @@ async function createQuote(page) {
 
 // ─── Quote Lines → Pricing Calculator → QLI → Quote Totals ───────────────────
 /**
+ * Validation order (per Quote Line Item):
+ *   Phase 1 — Pricing Calculator formulas
+ *     Fill/adjust as needed, then validate every calculator field against formulas
+ *     (Selling, Supplier, Landed Material, Provisions, Landed Cost, W/S, Profitability, GP%).
+ *   Phase 2 — Calculator ↔ QLI (only if Phase 1 passed)
+ *     Capture live Pricing Calculator values → Save → Refresh Quote → Open QLI →
+ *     Refresh QLI → Capture QLI values → shared fields must match Calculator.
+ *
  * Acceptance Criteria formulas:
  * Display (after Apply Configuration) — per Quote Line Item calculator:
  *   Total Project Cost = Landed Cost (SAR) + Total W/S Value + Total VAT Value
@@ -8074,8 +8113,9 @@ async function createQuote(page) {
  *   Bank Charges for LCs/LGs   1% → Total After × 1%
  *   Risk / Penalties           3% → Total After × 3%
  * Consumables — Landed Cost (SAR) on Provision Charges section:
- *   Landed Material Cost  = Total Supplier Price (SAR) from Supplier Cost & Basic Info
- *   Landed Cost (SAR)     = Landed Material Cost + All Provision Charges
+ *   Landed Cost (SAR) = Total Supplier Price (SAR) + All Provision Charges
+ *   (UI may also show Landed Material Cost = Total Supplier Price — same base, not freight/customs like ME)
+ *   Each provision charge = rate% × Total Selling Price After Discount (SAR)
  * Consumables — Profitability Summary:
  *   Total Selling Amount (SAR) = Unit Sales Price After Discount × Quantity
  *   Total Project Cost (SAR)   = Landed Cost (SAR)
@@ -8866,9 +8906,14 @@ function pickValue(map, ...aliases) {
   // fuzzy contains
   for (const a of aliases) {
     const needle = fieldKey(a);
+    const wantsLandedMaterial = /landed/.test(needle) && /material/.test(needle);
+    const wantsLandedCost = /landed/.test(needle) && /cost/.test(needle) && !wantsLandedMaterial;
     for (const [k, v] of Object.entries(map)) {
       if (!k.includes(needle) || !Number.isFinite(v)) continue;
       if (/after/.test(needle) && /before/.test(k)) continue;
+      // Landed Material Cost and Landed Cost are different fields — never cross-match
+      if (wantsLandedMaterial && !/material/.test(k)) continue;
+      if (wantsLandedCost && /material/.test(k)) continue;
       return v;
     }
   }
@@ -9141,6 +9186,7 @@ function validateMedicalEquipmentKeyTotals(tag, ui, inputs, validationRows) {
     snapshot: {
       netSellingInclVat: ui.netSellingInclVat,
       totalSupplierPrice: firstFinite(ui.totalSupplierPrice, expSupplier),
+      // UI first for QLI compare; formula still validated above via validateAgainstFormulas
       landedMaterialCost: firstFinite(ui.landedMaterialCost, expLandedMat),
       landedCost: firstFinite(ui.landedCost, expLandedCost),
       totalWsValue: ui.totalWsValue,
@@ -9314,6 +9360,76 @@ async function captureQliRecordFieldMap(page) {
   return { map, access };
 }
 
+/** Remove Calculator vs QLI compare rows so a refresh re-compare does not duplicate. */
+function pruneCalculatorQliCompareRows(rows, tag) {
+  const prefixes = [
+    `${tag} Calculator vs QLI:`,
+    `${tag} on Calculator only`,
+    `${tag} on QLI only`,
+    `${tag} shared Calculator ∩ QLI fields`,
+  ];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const section = String(rows[i]?.section || '');
+    if (prefixes.some((p) => section.startsWith(p))) rows.splice(i, 1);
+  }
+}
+
+/** Refresh Quote Line Item record — always after Calculator Save so captured values are current. */
+async function refreshQuoteLineItemRecord(page) {
+  progress('12. QLI record — Refresh after Calculator Save (capture only after refresh)');
+  await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
+  const refreshBtn = page
+    .getByRole('button', { name: /^refresh$/i })
+    .or(page.locator('button[title="Refresh"], button[name="refreshButton"], lightning-button-icon[title="Refresh"]'))
+    .first();
+  if (await refreshBtn.isVisible({ timeout: 4_000 }).catch(() => false)) {
+    await refreshBtn.click();
+  } else {
+    const url = page.url();
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    if (url) await page.waitForURL(/QuoteLineItem|\/0QL/i, { timeout: 45_000 }).catch(() => {});
+  }
+  await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 60_000 }).catch(() => {});
+  await sleep(1_000);
+  await scrollRecordPageFully(page).catch(() => {});
+  await openAllQliPricingSections(page).catch(() => {});
+  progress('12. QLI record Refresh done — ready to capture values');
+}
+
+/**
+ * Compare Pricing Calculator field map to QLI after Save + Quote refresh + QLI refresh.
+ * Captures QLI values only after refresh (caller should already have refreshed; we refresh once more if not).
+ */
+async function validateCalculatorVsQliWithRefresh(page, tag, calcFieldMap, validationRows, preloaded = null) {
+  let qliFieldMap = preloaded?.map;
+  let access = preloaded?.access;
+  const alreadyRefreshed = !!preloaded?.refreshed;
+
+  if (!alreadyRefreshed) {
+    progress(`12. ${tag} QLI not refreshed yet — Refresh before capture`);
+    await refreshQuoteLineItemRecord(page);
+    ({ map: qliFieldMap, access } = await captureQliRecordFieldMap(page));
+  } else if (!qliFieldMap) {
+    ({ map: qliFieldMap, access } = await captureQliRecordFieldMap(page));
+  }
+
+  let ok = compareSharedCalculatorQliFields(tag, calcFieldMap, qliFieldMap, validationRows);
+  if (ok) return { ok, qliFieldMap, access, refreshed: true };
+
+  // Second chance: refresh QLI once more and re-capture
+  progress(`12. ${tag} Calculator vs QLI mismatch — Refresh QLI again and re-capture`);
+  await refreshQuoteLineItemRecord(page);
+  pruneCalculatorQliCompareRows(validationRows, tag);
+  ({ map: qliFieldMap, access } = await captureQliRecordFieldMap(page));
+  ok = compareSharedCalculatorQliFields(tag, calcFieldMap, qliFieldMap, validationRows);
+  if (ok) {
+    progress(`12. ${tag} Calculator vs QLI — PASS after second QLI Refresh`);
+  } else {
+    progress(`12. ${tag} Calculator vs QLI — still mismatched after QLI Refresh`);
+  }
+  return { ok, qliFieldMap, access, refreshed: true };
+}
+
 function mergeCalcSnapshotIntoFieldMap(map, snap) {
   if (!snap) return map;
   const put = (label, n) => {
@@ -9339,9 +9455,11 @@ function mergeCalcSnapshotIntoFieldMap(map, snap) {
   put('Customs Duty Amount', snap.customsAmt);
   put('Customs Duty Amount (SAR)', snap.customsAmt);
   put('Total Freight & Customs (SAR)', snap.totalFreightCustoms);
+  // Prefer live Calculator UI for landed fields (formula snapshot can use stale Total Supplier)
   put('Landed Material Cost (SAR)', snap.landedMaterialCost);
   put('Landed Material Cost', snap.landedMaterialCost);
   put('Landed Cost (SAR)', snap.landedCost);
+  put('Landed Cost', snap.landedCost);
   put('Total W/S Value (SAR)', snap.totalWsValue);
   put('Total VAT Value (SAR)', snap.totalVatValue);
   put('Total EK02 Charges', snap.totalEk02);
@@ -10326,6 +10444,147 @@ async function browseCatalogsAndAddQuoteLines(page, { minProducts = ADD_PRODUCT_
   return n;
 }
 
+/** Resolve Show Actions on a real QLI data row (product-linked), not list chrome. */
+async function resolveQliRowMenuButton(page, rowIndex = 0) {
+  await scrollQuoteLineItemsIntoView(page).catch(() => {});
+  await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 25_000 }).catch(() => {});
+
+  let rows = await quoteLineItemRows(page);
+  let rowCount = await rows.count().catch(() => 0);
+  if (rowCount < 1) {
+    await waitForQuoteLineItemsToLoad(page, { attempts: 10, waitMs: 1_500 });
+    rows = await quoteLineItemRows(page);
+    rowCount = await rows.count().catch(() => 0);
+  }
+  progress(`12. QLI data rows visible — ${rowCount}`);
+  if (rowCount < 1) return { menuBtn: null, rowCount: 0, showCount: 0, rows: null };
+
+  if (rowIndex >= rowCount) {
+    throw new Error(`Quote Line Item row ${rowIndex + 1} not found (only ${rowCount} data rows)`);
+  }
+
+  const rowMenuBtn = (row) =>
+    row
+      .getByRole('button', { name: /^show\s*(more\s*)?actions$/i })
+      .or(
+        row.locator(
+          'button[title="Show Actions"], button[title="Show more actions"], button[aria-label*="Show Actions" i], lightning-button-menu button, lightning-button-menu',
+        ),
+      )
+      .first();
+
+  let row = rows.nth(rowIndex);
+  await row.scrollIntoViewIfNeeded().catch(() => {});
+  await row.hover().catch(() => {});
+  await sleep(250);
+
+  let menuBtn = rowMenuBtn(row);
+  for (let w = 0; w < 15; w++) {
+    if (await menuBtn.isVisible({ timeout: 400 }).catch(() => false)) break;
+    await sleep(700);
+    await scrollQuoteLineItemsIntoView(page).catch(() => {});
+    rows = await quoteLineItemRows(page);
+    rowCount = await rows.count().catch(() => 0);
+    if (rowIndex >= rowCount) break;
+    row = rows.nth(rowIndex);
+    await row.hover().catch(() => {});
+    menuBtn = rowMenuBtn(row);
+  }
+
+  return { menuBtn, row, rowCount, showCount: rowCount, rows };
+}
+
+/** LWC grids often hide Show Actions from Playwright — click via row DOM / shadow root. */
+async function clickQliShowActionsDom(page, rowIndex = 0) {
+  const clickInRoot = (root, idx) => {
+    const isDataRow = (tr) => {
+      const text = (tr.innerText || '').replace(/\s+/g, ' ');
+      if (/no items|nothing to see|get started|^loading$/i.test(text)) return false;
+      const links = tr.querySelectorAll(
+        'a[href*="/0QL"], a[href*="QuoteLineItem"], a[href*="/Product2/"], a[href*="/01t"], th a, td a',
+      );
+      return links.length > 0 || /show\s*actions/i.test(text);
+    };
+    const walkShadow = (node, fn) => {
+      if (!node) return null;
+      const hit = fn(node);
+      if (hit) return hit;
+      if (node.shadowRoot) {
+        for (const el of node.shadowRoot.querySelectorAll('*')) {
+          const inner = walkShadow(el, fn);
+          if (inner) return inner;
+        }
+      }
+      for (const el of node.querySelectorAll?.('*') || []) {
+        if (el.shadowRoot) {
+          const inner = walkShadow(el, fn);
+          if (inner) return inner;
+        }
+      }
+      return null;
+    };
+    const scope = root && root.querySelectorAll ? root : document;
+    const rows = [...scope.querySelectorAll('table tbody tr, [role="row"]')].filter(isDataRow);
+    const tr = rows[idx];
+    if (!tr) return false;
+    tr.scrollIntoView({ block: 'center' });
+    const btn =
+      walkShadow(tr, (n) => {
+        if (n.tagName === 'BUTTON') {
+          const t = `${n.title || ''} ${n.getAttribute('aria-label') || ''} ${n.innerText || ''}`;
+          if (/show\s*actions/i.test(t)) return n;
+        }
+        return null;
+      }) ||
+      tr.querySelector('button[title="Show Actions"], button[title="Show more actions"], lightning-button-menu button');
+    if (btn) {
+      btn.click();
+      return true;
+    }
+    const menu = tr.querySelector('lightning-button-menu');
+    if (menu) {
+      const shadowBtn = walkShadow(menu, (n) => (n.tagName === 'BUTTON' ? n : null));
+      if (shadowBtn) {
+        shadowBtn.click();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const card = await quoteLineItemsTable(page);
+  const inCard = await card.evaluate(clickInRoot, rowIndex).catch(() => false);
+  if (inCard) return true;
+  return page
+    .evaluate(
+      (idx) => {
+        const root = document;
+        const isDataRow = (tr) => {
+          const text = (tr.innerText || '').replace(/\s+/g, ' ');
+          if (/no items|nothing to see|get started|^loading$/i.test(text)) return false;
+          return (
+            tr.querySelectorAll('a[href*="/0QL"], a[href*="QuoteLineItem"], a[href*="/Product2/"], th a, td a')
+              .length > 0 || /show\s*actions/i.test(text)
+          );
+        };
+        const rows = [...root.querySelectorAll('table tbody tr, [role="row"]')].filter(isDataRow);
+        const tr = rows[idx];
+        if (!tr) return false;
+        tr.scrollIntoView({ block: 'center' });
+        const btn = tr.querySelector(
+          'button[title="Show Actions"], button[title="Show more actions"], lightning-button-menu button',
+        );
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        return false;
+      },
+      rowIndex,
+    )
+    .catch(() => false);
+}
+
 /** rowIndex: 0-based. Configure = that line’s Pricing Calculator; View = that line’s QLI record. */
 async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
   // Always force Lines — after Calculator Save we are on Details
@@ -10333,6 +10592,7 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
   await scrollQuoteLineItemsIntoView(page);
   await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
   await waitForLightningRecordHome(page, { timeout: 20_000 }).catch(() => {});
+  await clickQuoteStalePriceRefresh(page, { timeout: 12_000 }).catch(() => {});
 
   const qliCard = page
     .getByRole('article', { name: /quote\s*line\s*items/i })
@@ -10344,18 +10604,13 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
     .first();
   await qliCard.waitFor({ state: 'visible', timeout: 30_000 });
 
-  // Data rows only (product link) — not list header / filter / sort chrome
   const dataRows = qliCard.locator('table tbody tr').filter({
     has: page.locator('a[href*="/lightning/r/"], a[data-refid], th a, td a'),
   });
   let rowCount = await dataRows.count().catch(() => 0);
-  if (rowCount < 1) {
-    // Some grids put the primary field in th without /lightning/r/ in href until hover
-    rowCount = await qliCard.locator('table tbody tr').count().catch(() => 0);
-  }
+  if (rowCount < 1) rowCount = await qliCard.locator('table tbody tr').count().catch(() => 0);
   progress(`12. QLI data rows visible — ${rowCount}`);
 
-  // Exact row ▾ used in screenshot: title/name "Show Actions" (not Filters / More Tabs / Delete-only)
   let showBtns = qliCard.locator(
     [
       'table tbody tr button[title="Show Actions"]',
@@ -10365,31 +10620,20 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
       'table tbody tr lightning-button-menu button',
     ].join(', '),
   );
-  // Prefer accessible name when title attribute missing
-  const byRole = qliCard
-    .locator('table tbody tr')
-    .getByRole('button', { name: /^show\s*(more\s*)?actions$/i });
   let showCount = await showBtns.count().catch(() => 0);
   if (showCount < 1) {
-    showBtns = byRole;
+    showBtns = qliCard.locator('table tbody tr').getByRole('button', { name: /^show\s*(more\s*)?actions$/i });
     showCount = await showBtns.count().catch(() => 0);
   }
   if (showCount < 1) {
     showBtns = qliCard.getByRole('button', { name: /^show\s*(more\s*)?actions$/i });
     showCount = await showBtns.count().catch(() => 0);
   }
-  // After Refresh / Save, Show Actions can take a few seconds to remount
-  for (let w = 0; showCount < 1 && w < 10; w++) {
+  for (let w = 0; showCount < 1 && w < 12; w++) {
     await sleep(800);
     await scrollQuoteLineItemsIntoView(page).catch(() => {});
     showBtns = qliCard.locator(
-      [
-        'table tbody tr button[title="Show Actions"]',
-        'table tbody tr button[title="Show more actions"]',
-        'table tbody tr button[aria-label="Show Actions"]',
-        'table tbody tr button[aria-label="Show more actions"]',
-        'table tbody tr lightning-button-menu button',
-      ].join(', '),
+      'table tbody tr button[title="Show Actions"], table tbody tr button[title="Show more actions"], table tbody tr lightning-button-menu button',
     );
     showCount = await showBtns.count().catch(() => 0);
     if (showCount < 1) {
@@ -10398,18 +10642,23 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
     }
   }
   if (showCount < 1) {
-    throw new Error('QLI Show Actions (▾) not found on Quote Line Items rows.');
+    progress('12. Card-level Show Actions missing — DOM fallback');
+    const domOk = await clickQliShowActionsDom(page, rowIndex);
+    if (!domOk) throw new Error('QLI Show Actions (▾) not found on Quote Line Items rows.');
+    showCount = Math.max(rowCount, rowIndex + 1);
   }
   if (rowIndex >= showCount) {
     throw new Error(`Quote Line Item row ${rowIndex + 1} not found (only ${showCount} Show Actions)`);
   }
 
-  const menuBtn = showBtns.nth(rowIndex);
-  await menuBtn.scrollIntoViewIfNeeded().catch(() => {});
-  const rowText = ((await menuBtn.locator('xpath=ancestor::tr[1]').innerText().catch(() => '')) || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60);
+  const menuBtn = showCount > 0 ? showBtns.nth(rowIndex) : null;
+  if (menuBtn) await menuBtn.scrollIntoViewIfNeeded().catch(() => {});
+  const rowText =
+    menuBtn &&
+    ((await menuBtn.locator('xpath=ancestor::tr[1]').innerText().catch(() => '')) || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 60);
   progress(`12. Opening QLI row ${rowIndex + 1}/${showCount} Show Actions${rowText ? ` — ${rowText}` : ''}`);
 
   async function readOpenMenuLabels() {
@@ -10441,7 +10690,11 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
   for (let tryOpen = 1; tryOpen <= 3; tryOpen++) {
     await page.keyboard.press('Escape').catch(() => {});
     await sleep(150);
-    await menuBtn.click({ force: tryOpen > 1 });
+    if (menuBtn && (await menuBtn.isVisible({ timeout: 800 }).catch(() => false))) {
+      await menuBtn.click({ force: tryOpen > 1 });
+    } else {
+      await clickQliShowActionsDom(page, rowIndex);
+    }
     await sleep(Math.max(LWC_MENU_ANIMATION_MS, 450));
     const flat = await readOpenMenuLabels();
     progress(`12. QLI ▾ menu (try ${tryOpen}/3): ${flat.join(' | ') || '(empty)'}`);
@@ -10462,7 +10715,7 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
       await waitForQuoteRecordVisible(page, { timeout: 45_000 }).catch(() => {});
       await waitForLightningRecordHome(page, { timeout: 25_000 }).catch(() => {});
       await openQuoteTab(page, 'Lines');
-      await waitForQuoteLineItemsToLoad(page, { attempts: 4, waitMs: 1_000 });
+      await waitForQuoteLineItemsToLoad(page, { attempts: 10, waitMs: 1_500 });
       return openQuoteLineRowMenuActionOnce(page, actionName, rowIndex);
     }
     throw new Error(`QLI row ${rowIndex + 1}: "${actionName}" not in Show Actions menu.`);
@@ -10477,18 +10730,22 @@ async function openQuoteLineRowMenuAction(page, actionName, rowIndex = 0) {
 
 /** Single attempt after reload (avoids infinite recursion). */
 async function openQuoteLineRowMenuActionOnce(page, actionName, rowIndex) {
+  await clickQuoteStalePriceRefresh(page, { timeout: 12_000 }).catch(() => {});
   const qliCard = page.getByRole('article', { name: /quote\s*line\s*items/i }).first();
   await qliCard.waitFor({ state: 'visible', timeout: 30_000 });
-  const menuBtn = qliCard
-    .locator(
-      'table tbody tr button[title="Show Actions"], table tbody tr button[title="Show more actions"], table tbody tr button[aria-label*="Show Actions" i]',
-    )
-    .or(qliCard.locator('table tbody tr').getByRole('button', { name: /^show\s*(more\s*)?actions$/i }))
-    .nth(rowIndex);
-  await menuBtn.waitFor({ state: 'visible', timeout: 20_000 });
-  await page.keyboard.press('Escape').catch(() => {});
-  await sleep(150);
-  await menuBtn.click({ force: true });
+  let showBtns = qliCard.locator(
+    'table tbody tr button[title="Show Actions"], table tbody tr button[title="Show more actions"], table tbody tr lightning-button-menu button',
+  );
+  let showCount = await showBtns.count().catch(() => 0);
+  if (showCount < 1) {
+    showBtns = qliCard.getByRole('button', { name: /^show\s*(more\s*)?actions$/i });
+    showCount = await showBtns.count().catch(() => 0);
+  }
+  if (showCount < 1) {
+    await clickQliShowActionsDom(page, rowIndex);
+  } else {
+    await showBtns.nth(rowIndex).click({ force: true });
+  }
   await sleep(500);
   const labels = await page
     .locator('[role="menuitem"]:visible, .slds-dropdown:visible a, .slds-dropdown:visible li')
@@ -10769,6 +11026,10 @@ async function fillPercentIfBlank(input, value, label) {
     progress(`12. Calculator percent "${label}" clamped ${value} → ${pct} (0–100)`);
   }
   const cur = await readEditableNumeric(input);
+  if (Number.isFinite(cur) && cur < 0) {
+    progress(`12. Calculator percent "${label}" is ${cur}% < 0 — updating to 0`);
+    return overwriteCalculatorInput(input, 0, `${label} (was ${cur}% < 0)`, { asPct: true });
+  }
   if (Number.isFinite(cur) && cur > 100) {
     progress(`12. Calculator percent "${label}" is ${cur}% > 100 — updating to ${pct}`);
     return overwriteCalculatorInput(input, pct, `${label} (was ${cur}% > 100)`, { asPct: true });
@@ -10818,10 +11079,9 @@ async function overwriteCalculatorInput(input, value, label, { asPct = false } =
 }
 
 /**
- * Any editable percentage > 100% → set to 100 (0–100 rule).
- * Then provision rates still > 10% → CALC_PROVISION_CAP_PCT so GP% stays positive.
+ * Editable percentages must stay 0–100. When onlyAbove100, fix illegal % only — do not cap provision rates for GP.
  */
-async function capHighProvisionChargeRates(page, tag = 'QLI') {
+async function capHighProvisionChargeRates(page, tag = 'QLI', { onlyAbove100 = false } = {}) {
   const root = await pricingCalculatorRoot(page);
   await expandCalculatorSection(page, /provision\s*charges?/i).catch(() => {});
   await expandCalculatorSection(page, /selling\s*price/i).catch(() => {});
@@ -10865,7 +11125,12 @@ async function capHighProvisionChargeRates(page, tag = 'QLI') {
 
     const hint = (meta.text || meta.aria || 'Percent').slice(0, 50);
 
-    // Rule: percentage cannot exceed 100 — update if more than 100%
+    // Rule: percentage must be 0–100
+    if (val < 0) {
+      await overwriteCalculatorInput(input, 0, `${hint} ${val}% → 0% (<0)`, { asPct: true });
+      changed += 1;
+      continue;
+    }
     if (val > 100) {
       const next = /provision|charge|mirror/i.test(ctx) ? CALC_PROVISION_CAP_PCT : 100;
       await overwriteCalculatorInput(input, next, `${hint} ${val}% → ${next}% (>100)`, { asPct: true });
@@ -10874,7 +11139,9 @@ async function capHighProvisionChargeRates(page, tag = 'QLI') {
       continue;
     }
 
-    // Provision-only: rates above 10% still capped for GP
+    if (onlyAbove100) continue;
+
+    // Provision-only: rates above 10% still capped for GP (only when GP bump may be needed)
     if (val <= CALC_PROVISION_RATE_MAX) continue;
     if (!/charge|provision|mirror/i.test(ctx) && !/%|percent|rate\s*%/i.test(ctx)) continue;
     if (/discount|freight|customs|exchange\s*rate|vat\s*%|warranty|quantity|sales\s*price|cost\s*price|supplier\s*price/i.test(ctx) &&
@@ -11038,12 +11305,72 @@ async function readProfitabilitySummaryFromUi(page) {
   return { selling, project, gpAmt, gpPct };
 }
 
+/** True when calculator already has selling values and GP% > 0 — skip fill/bump, validate only. */
+async function shouldSkipCalculatorEdits(page, tag = 'QLI') {
+  await scrollPricingCalculatorFullPage(page).catch(() => {});
+  await expandCalculatorSection(page, /profitability\s*summary/i).catch(() => {});
+  const ui = await readProfitabilitySummaryFromUi(page);
+  const selling = ui.selling;
+  const project = ui.project;
+  const gpPct = firstFinite(
+    ui.gpPct,
+    Number.isFinite(selling) && Number.isFinite(project) ? expectedGpPct(selling, project) : NaN,
+  );
+  const gpOk =
+    (Number.isFinite(gpPct) && gpPct > 0) ||
+    (Number.isFinite(selling) && Number.isFinite(project) && selling > project + MONEY_TOLERANCE);
+  if (!gpOk) return false;
+
+  await expandCalculatorSection(page, /selling\s*price/i).catch(() => {});
+  const map = await readLabeledNumericMap(await pricingCalculatorRoot(page));
+  const unitBefore = pickValue(map, 'Unit Sales Price Before Discount (SAR)', 'Unit Sales Price Before Discount');
+  const totalAfter = pickValue(
+    map,
+    'Total Selling Price After Discount (SAR)',
+    'Total Selling Price After Discount',
+    'Total Selling Amount (SAR)',
+    'Total Selling Amount',
+  );
+  const filled =
+    Number.isFinite(unitBefore) &&
+    unitBefore > MONEY_TOLERANCE &&
+    Number.isFinite(totalAfter) &&
+    totalAfter > MONEY_TOLERANCE;
+  if (!filled) return false;
+
+  progress(
+    `12. ${tag} Calculator already configured — GP%=${pctFmt(gpPct)} positive; skip fill/GP bump (validate only, percent 0–100)`,
+  );
+  return true;
+}
+
 /**
  * Keep GP% positive: if GP% ≤ 0 (or Selling ≤ Project Cost), raise
  * Unit Sales Price Before Discount (SAR) and/or Quantity until Selling > Project.
- * Reads values from "6. Profitability Summary" (screenshot).
+ * When skipEdits or GP already positive, do not change prices/qty — only clamp illegal % (>100 or <0).
  */
-async function ensurePositiveGrossProfit(page, tag = 'QLI', hints = {}) {
+async function ensurePositiveGrossProfit(page, tag = 'QLI', hints = {}, { skipEdits = false } = {}) {
+  const ui0 = await readProfitabilitySummaryFromUi(page);
+  let selling = firstFinite(ui0.selling, hints.selling);
+  let project = firstFinite(ui0.project, hints.project);
+  let gpPct = firstFinite(
+    ui0.gpPct,
+    Number.isFinite(selling) && Number.isFinite(project) ? expectedGpPct(selling, project) : NaN,
+  );
+  const totalsOk =
+    Number.isFinite(selling) && Number.isFinite(project) && selling > project + MONEY_TOLERANCE;
+  const gpOk = Number.isFinite(gpPct) && gpPct > 0;
+
+  if (skipEdits || totalsOk || gpOk) {
+    await capHighProvisionChargeRates(page, tag, { onlyAbove100: true });
+    progress(
+      skipEdits
+        ? `12. ${tag} validate-only — skip fill/GP bump (GP%=${pctFmt(gpPct)})`
+        : `12. ${tag} GP positive — skip Unit/Qty bump (Selling=${moneyFmt(selling)} Project=${moneyFmt(project)} GP%=${pctFmt(gpPct)})`,
+    );
+    return { ok: skipEdits ? totalsOk || gpOk : totalsOk || gpOk, selling, project, gpPct, gpAmt: ui0.gpAmt };
+  }
+
   await capHighProvisionChargeRates(page, tag);
   await clickApplyConfiguration(page);
 
@@ -11143,9 +11470,9 @@ async function ensurePositiveGrossProfit(page, tag = 'QLI', hints = {}) {
   }
 
   const finalUi = await readProfitabilitySummaryFromUi(page);
-  const selling = firstFinite(finalUi.selling, hints.selling);
-  const project = firstFinite(finalUi.project, hints.project);
-  const gpPct = firstFinite(
+  selling = firstFinite(finalUi.selling, hints.selling);
+  project = firstFinite(finalUi.project, hints.project);
+  gpPct = firstFinite(
     finalUi.gpPct,
     Number.isFinite(selling) && Number.isFinite(project) ? expectedGpPct(selling, project) : NaN,
   );
@@ -11387,19 +11714,18 @@ async function readCalculatorSpPriceOriginal(page, { waitPopulateMs = 6_000 } = 
  *   Total After = Total Before − Discount Amount
  *   Unit After (back-calculated) = Total After / Qty
  */
-async function fillAndValidateConsumablesSellingPriceSection(page, validationRows, tag = 'QLI') {
+async function fillAndValidateConsumablesSellingPriceSection(page, validationRows, tag = 'QLI', { skipEdits = false } = {}) {
   await expandCalculatorSection(page, /selling\s*price/i);
   const root = await pricingCalculatorRoot(page);
   progress(`12. ${tag} Consumables — Selling Price & Discount`);
 
   const unitBeforeInput = await findEditableByLabel(root, /unit\s*sales\s*price\s*before\s*discount/i);
-  await fillIfBlankOrZero(unitBeforeInput, CALC_UNIT_PRICE, 'Unit Sales Price Before Discount');
-
   const discountPctInput = await findEditableByLabel(root, /customer\s*discount\s*\(?%\)?|discount\s*%/i);
-  await fillPercentIfBlank(discountPctInput, CALC_DISCOUNT_PCT, 'Customer Discount (%)');
-  // Discount Amount is calculated in UI — do not overwrite
-
-  await clickApplyConfiguration(page);
+  if (!skipEdits) {
+    await fillIfBlankOrZero(unitBeforeInput, CALC_UNIT_PRICE, 'Unit Sales Price Before Discount');
+    await fillPercentIfBlank(discountPctInput, CALC_DISCOUNT_PCT, 'Customer Discount (%)');
+    await clickApplyConfiguration(page);
+  }
 
   const values = await readLabeledNumericMap(root);
   const qtyInput = await findEditableByLabel(root, /^quantity$/i);
@@ -11611,9 +11937,9 @@ async function validateConsumablesSupplierCostSection(page, quantity, validation
 
 /**
  * Consumables — Landed Cost (under Provision Charges in UI)
- *   Landed Material Cost = Total Supplier Price (SAR) from Supplier Cost & Basic Info
- *   Landed Cost (SAR)    = Landed Material Cost + All Provision Charges
- *   (each provision = % of Total Selling Price After Discount)
+ *   Landed Cost (SAR) = Total Supplier Price (SAR) + All Provision Charges
+ *   All provision charges = rate% × Total Selling Price After Discount (SAR)
+ *   (UI may label Total Supplier as Landed Material Cost — validate separately when shown)
  */
 async function validateConsumablesLandedMaterialCost(
   page,
@@ -11624,7 +11950,7 @@ async function validateConsumablesLandedMaterialCost(
   await expandCalculatorSection(page, /provision\s*charges?|landed\s*cost|landed\s*material/i);
   const root = await pricingCalculatorRoot(page);
   progress(
-    `12. ${tag} Consumables — Landed Cost (Landed Material = Total Supplier; + Provision Charges)`,
+    `12. ${tag} Consumables — Landed Cost (= Total Supplier Price + All Provision Charges)`,
   );
 
   const values = await readLabeledNumericMap(root);
@@ -11658,11 +11984,10 @@ async function validateConsumablesLandedMaterialCost(
         validationRows,
       ) && ok;
 
-    const materialForLanded = firstFinite(landedMaterial, totalSupplier);
-    const expectedLanded = materialForLanded + (Number.isFinite(sumProvisions) ? sumProvisions : 0);
+    const expectedLanded = totalSupplier + (Number.isFinite(sumProvisions) ? sumProvisions : 0);
     ok =
       validateAgainstFormulas(
-        `${tag} Prov: Landed Cost (SAR) (= Landed Material + All Provisions)`,
+        `${tag} Prov: Landed Cost (SAR) (= Total Supplier Price + All Provision Charges)`,
         landed,
         expectedLanded,
         validationRows,
@@ -11746,9 +12071,12 @@ function validateConsumablesKeyTotals(tag, ui, inputs, validationRows) {
   const expTotalAfter = firstFinite(expectedTotalAfter, ui.totalSellingAfterDiscount);
   const expSupplier =
     Number.isFinite(supplierUnitPrice) && Number.isFinite(qty) ? supplierUnitPrice * qty : NaN;
-  const material = firstFinite(ui.landedMaterialCost, ui.totalSupplierPrice, expSupplier);
+  const totalSupplier = firstFinite(ui.totalSupplierPrice, expSupplier);
   const expLanded =
-    Number.isFinite(material) ? material + (Number.isFinite(provisionSum) ? provisionSum : 0) : NaN;
+    Number.isFinite(totalSupplier)
+      ? totalSupplier + (Number.isFinite(provisionSum) ? provisionSum : 0)
+      : NaN;
+  const expLandedMaterial = totalSupplier;
   const expSellingAmt =
     Number.isFinite(unitAfter) && Number.isFinite(qty)
       ? unitAfter * qty
@@ -11769,16 +12097,18 @@ function validateConsumablesKeyTotals(tag, ui, inputs, validationRows) {
       expSupplier,
       validationRows,
     ) && ok;
+  if (Number.isFinite(ui.landedMaterialCost)) {
+    ok =
+      validateAgainstFormulas(
+        `${tag} Cons Calc: Landed Material Cost (= Total Supplier Price)`,
+        ui.landedMaterialCost,
+        expLandedMaterial,
+        validationRows,
+      ) && ok;
+  }
   ok =
     validateAgainstFormulas(
-      `${tag} Cons Calc: Landed Material Cost (= Total Supplier Price)`,
-      ui.landedMaterialCost,
-      firstFinite(ui.totalSupplierPrice, expSupplier),
-      validationRows,
-    ) && ok;
-  ok =
-    validateAgainstFormulas(
-      `${tag} Cons Calc: Landed Cost (SAR) (= Landed Material + Provisions)`,
+      `${tag} Cons Calc: Landed Cost (SAR) (= Total Supplier Price + All Provision Charges)`,
       ui.landedCost,
       expLanded,
       validationRows,
@@ -11820,8 +12150,9 @@ function validateConsumablesKeyTotals(tag, ui, inputs, validationRows) {
     snapshot: {
       totalSellingAfterDiscount: firstFinite(ui.totalSellingAfterDiscount, expTotalAfter, snapSell),
       totalSupplierPrice: firstFinite(ui.totalSupplierPrice, expSupplier),
-      landedMaterialCost: firstFinite(ui.landedMaterialCost, material),
-      landedCost: firstFinite(ui.landedCost, expLanded),
+      landedMaterialCost: firstFinite(expLandedMaterial, ui.landedMaterialCost),
+      landedCost: firstFinite(expLanded, ui.landedCost),
+      totalEk02: Number.isFinite(provisionSum) ? provisionSum : NaN,
       totalSellingAmount: snapSell,
       totalProjectCost: snapProj,
       gpAmount: firstFinite(ui.gpAmount, expectedGpAmount(snapSell, snapProj)),
@@ -11904,7 +12235,12 @@ function validateQliConsumablesSectionsVsCalculator(tag, qliSections, calcSnap, 
       qliSections.provisions.landedMaterialCost,
       firstFinite(calcSnap.landedMaterialCost, calcSnap.totalSupplierPrice),
     ) && ok;
-  ok = cmp('Provisions: Landed Cost (SAR)', qliSections.provisions.landedCost, calcSnap.landedCost) && ok;
+  ok =
+    cmp(
+      'Provisions: Landed Cost (SAR) (= Total Supplier + Provisions)',
+      qliSections.provisions.landedCost,
+      calcSnap.landedCost,
+    ) && ok;
   progress(`12. ${tag} QLI View — Consumables Profitability vs calculator`);
   ok =
     cmp(
@@ -11927,13 +12263,13 @@ function validateQliConsumablesSectionsVsCalculator(tag, qliSections, calcSnap, 
 /**
  * Consumables — Profitability Summary (formulas shown on calculator)
  *   Total Selling Amount (SAR) = Unit Sales Price After Discount × Quantity
- *   Total Project Cost (SAR)   = Landed Cost (Landed Material Cost)
+ *   Total Project Cost (SAR)   = Landed Cost (SAR)
  *   GP Amount (SAR)            = Total Selling Amount − Total Project Cost
  *   GP %                       = GP Amount / Total Selling Amount × 100
  */
 async function validateConsumablesProfitabilitySection(
   page,
-  { unitAfter, qty, landedMaterialCost, totalSellingAfterDiscount },
+  { unitAfter, qty, landedCost, totalSellingAfterDiscount },
   validationRows,
   tag = 'QLI',
 ) {
@@ -11968,7 +12304,7 @@ async function validateConsumablesProfitabilitySection(
       : Number.isFinite(totalSellingAfterDiscount)
         ? totalSellingAfterDiscount
         : NaN;
-  const expProject = Number.isFinite(landedMaterialCost) ? landedMaterialCost : NaN;
+  const expProject = Number.isFinite(landedCost) ? landedCost : NaN;
 
   let ok = true;
   if (Number.isFinite(expSelling)) {
@@ -12070,22 +12406,22 @@ async function setCalculatorPicklist(scope, labelRe, optionText) {
  *   Unit After (back-calculated) = Total After / Qty
  *   Net Selling Incl. VAT = Total After + VAT Amount (From Services)
  */
-async function fillAndValidateMedicalEquipmentSellingPriceSection(page, validationRows, tag = 'QLI') {
+async function fillAndValidateMedicalEquipmentSellingPriceSection(page, validationRows, tag = 'QLI', { skipEdits = false } = {}) {
   await expandCalculatorSection(page, /selling\s*price/i);
   const root = await pricingCalculatorRoot(page);
   progress(`12. ${tag} Medical Equipment — Selling Price & Discount`);
 
   const unitBeforeInput = await findEditableByLabel(root, /unit\s*sales\s*price\s*before\s*discount/i);
-  await fillIfBlankOrZero(unitBeforeInput, CALC_UNIT_PRICE, 'Unit Sales Price Before Discount (SAR)');
-
   const discountPctInput = await findEditableByLabel(
     root,
     /customer\s*discount\s*\(?%\)?|discount\s*\(?%\)?/i,
   );
-  await fillPercentIfBlank(discountPctInput, CALC_DISCOUNT_PCT, 'Customer Discount (%)');
-
-  await clickApplyConfiguration(page);
-  await sleep(800);
+  if (!skipEdits) {
+    await fillIfBlankOrZero(unitBeforeInput, CALC_UNIT_PRICE, 'Unit Sales Price Before Discount (SAR)');
+    await fillPercentIfBlank(discountPctInput, CALC_DISCOUNT_PCT, 'Customer Discount (%)');
+    await clickApplyConfiguration(page);
+    await sleep(800);
+  }
   await expandCalculatorSection(page, /selling\s*price/i);
   let values = await readLabeledNumericMap(root);
   const qtyInput = await findEditableByLabel(root, /^quantity$/i);
@@ -12236,12 +12572,14 @@ async function fillAndValidateMedicalEquipmentSellingPriceSection(page, validati
  *   Supplier Price in original currency; SP Price (SAR) = Supplier Price × Exchange Rate
  *   Total Supplier Price (SAR) = SP Price (SAR) × Quantity
  */
-async function fillAndValidateMedicalEquipmentSupplierCostSection(page, quantity, validationRows, tag = 'QLI') {
+async function fillAndValidateMedicalEquipmentSupplierCostSection(page, quantity, validationRows, tag = 'QLI', { skipEdits = false } = {}) {
   await expandCalculatorSection(page, /supplier\s*cost|supplier\s*price/i);
   const root = await pricingCalculatorRoot(page);
   progress(`12. ${tag} Medical Equipment — Supplier Cost Calculation`);
 
-  await setCalculatorPicklist(root, /^currency$/i, CALC_CURRENCY);
+  if (!skipEdits) {
+    await setCalculatorPicklist(root, /^currency$/i, CALC_CURRENCY);
+  }
 
   const isSar = /^sar$/i.test(CALC_CURRENCY);
   const valuesAfterFx = await readLabeledNumericMap(root);
@@ -12263,9 +12601,10 @@ async function fillAndValidateMedicalEquipmentSupplierCostSection(page, quantity
   }
 
   const supplierPriceInput = await findEditableByLabel(root, /^supplier\s*price(?!\s*\(sar\))/i);
-  await fillIfBlankOrZero(supplierPriceInput, CALC_SUPPLIER_PRICE, 'Supplier Price (original currency)');
-
-  await clickApplyConfiguration(page);
+  if (!skipEdits) {
+    await fillIfBlankOrZero(supplierPriceInput, CALC_SUPPLIER_PRICE, 'Supplier Price (original currency)');
+    await clickApplyConfiguration(page);
+  }
   const values = await readLabeledNumericMap(root);
   const supplierPrice = pickValue(values, 'Supplier Price', 'Supplier Price (Original)');
   const exchangeRate = pickValue(values, 'Exchange Rate') || (isSar ? 1 : fx);
@@ -12385,13 +12724,24 @@ async function readLandedMaterialCostTable(page, { totalSupplierPrice } = {}) {
           : NaN;
   if (Number.isFinite(expFc)) out.totalFreightCustoms = expFc;
 
-  // Source of truth:
-  // Landed Material Cost (SAR) = Total Supplier Price (SAR) + Freight & Insurance Amount + Customs Duty Amount
-  if (Number.isFinite(totalSupplier)) {
-    out.landedMaterialCost =
-      totalSupplier +
+  // Formula: Landed Material = Total Supplier + Freight + Customs (use when UI amount missing)
+  const formulaLanded = Number.isFinite(totalSupplier)
+    ? totalSupplier +
       (Number.isFinite(out.freightAmt) ? out.freightAmt : 0) +
-      (Number.isFinite(out.customsAmt) ? out.customsAmt : 0);
+      (Number.isFinite(out.customsAmt) ? out.customsAmt : 0)
+    : NaN;
+  // Prefer on-screen Landed Material Cost — formula recompute can use stale Total Supplier and false-fail vs QLI
+  out.landedMaterialCost = firstFinite(parsed.landedMat?.amount, formulaLanded);
+  out.landedMaterialCostFormula = formulaLanded;
+  if (
+    Number.isFinite(parsed.landedMat?.amount) &&
+    Number.isFinite(formulaLanded) &&
+    !nearlyEqual(parsed.landedMat.amount, formulaLanded)
+  ) {
+    progress(
+      `12. WARN — Landed Material UI=${moneyFmt(parsed.landedMat.amount)} ≠ formula=${moneyFmt(formulaLanded)} ` +
+        `(Total Supplier=${moneyFmt(totalSupplier)}); using UI for Calculator↔QLI compare`,
+    );
   }
 
   progress(
@@ -12404,19 +12754,21 @@ async function readLandedMaterialCostTable(page, { totalSupplierPrice } = {}) {
 
 function applyLandedMaterialCostTableToMap(map, table) {
   if (!map || !table) return map;
-  const put = (label, n) => {
+  // Fill blanks only — never overwrite labels already scraped from the calculator UI
+  const putIfBlank = (label, n) => {
     if (!Number.isFinite(n)) return;
-    map[fieldKey(label)] = n;
+    const k = fieldKey(label);
+    if (!Number.isFinite(map[k])) map[k] = n;
   };
-  put('Freight & Insurance Amount (SAR)', table.freightAmt);
-  put('Freight & Insurance Amount', table.freightAmt);
-  put('Freight & Insurance (%)', table.freightPct);
-  put('Customs Duty Amount (SAR)', table.customsAmt);
-  put('Customs Duty Amount', table.customsAmt);
-  put('Customs Duty (%)', table.customsPct);
-  put('Total Freight & Customs (SAR)', table.totalFreightCustoms);
-  put('Landed Material Cost (SAR)', table.landedMaterialCost);
-  put('Landed Material Cost', table.landedMaterialCost);
+  putIfBlank('Freight & Insurance Amount (SAR)', table.freightAmt);
+  putIfBlank('Freight & Insurance Amount', table.freightAmt);
+  putIfBlank('Freight & Insurance (%)', table.freightPct);
+  putIfBlank('Customs Duty Amount (SAR)', table.customsAmt);
+  putIfBlank('Customs Duty Amount', table.customsAmt);
+  putIfBlank('Customs Duty (%)', table.customsPct);
+  putIfBlank('Total Freight & Customs (SAR)', table.totalFreightCustoms);
+  putIfBlank('Landed Material Cost (SAR)', table.landedMaterialCost);
+  putIfBlank('Landed Material Cost', table.landedMaterialCost);
   return map;
 }
 
@@ -12425,17 +12777,18 @@ async function fillAndValidateMedicalEquipmentLandedCostSection(
   { totalSupplierPrice, isSar },
   validationRows,
   tag = 'QLI',
+  { skipEdits = false } = {},
 ) {
   await expandCalculatorSection(page, /landed\s*material\s*cost|landed\s*cost/i);
   const root = await pricingCalculatorRoot(page);
   progress(`12. ${tag} Medical Equipment — Landed Material Cost`);
 
-  // Updated UI: Freight & Customs rates are shown; amounts = Total Supplier × Rate% / 100
-  // Only fill Rate (%) — never overwrite Amount (SAR) if the same label matches both cells
   const freightPctInput = await findEditableByLabel(root, /freight\s*&\s*insurance/i);
   const customsPctInput = await findEditableByLabel(root, /customs\s*duty/i);
-  await fillPercentIfBlank(freightPctInput, CALC_FREIGHT_PCT, 'Freight & Insurance (%)');
-  await fillPercentIfBlank(customsPctInput, CALC_CUSTOMS_PCT, 'Customs Duty (%)');
+  if (!skipEdits) {
+    await fillPercentIfBlank(freightPctInput, CALC_FREIGHT_PCT, 'Freight & Insurance (%)');
+    await fillPercentIfBlank(customsPctInput, CALC_CUSTOMS_PCT, 'Customs Duty (%)');
+  }
   if (isSar) {
     progress(`12. ${tag} ME Landed — Currency=SAR (Freight/Customs rates may still display; amounts follow Total Supplier)`);
   }
@@ -12537,12 +12890,12 @@ async function fillAndValidateMedicalEquipmentLandedCostSection(
  */
 async function validateMedicalEquipmentProvisionCharges(
   page,
-  { totalSellingAfterDiscount, landedMaterialCost },
+  { totalSellingAfterDiscount, landedMaterialCost, skipEdits = false },
   validationRows,
   tag = 'QLI',
 ) {
   await expandCalculatorSection(page, /provision\s*charges?|ek02/i);
-  await capHighProvisionChargeRates(page, tag);
+  await capHighProvisionChargeRates(page, tag, { onlyAbove100: skipEdits });
   const root = await pricingCalculatorRoot(page);
   progress(`12. ${tag} Medical Equipment — Provision Charges (default rates + EK02 / AFMS)`);
 
@@ -12696,7 +13049,7 @@ async function fillAndValidateMedicalEquipmentWarrantyServices(
   page,
   validationRows,
   tag = 'QLI',
-  { totalSellingPriceAfterDiscount = NaN, unitSalesPriceAfterDiscount = NaN } = {},
+  { totalSellingPriceAfterDiscount = NaN, unitSalesPriceAfterDiscount = NaN, skipEdits = false } = {},
 ) {
   // Renamed base: Total Selling Price After Discount (SAR) × %
   const warrantyBase = firstFinite(totalSellingPriceAfterDiscount, unitSalesPriceAfterDiscount);
@@ -12784,22 +13137,23 @@ async function fillAndValidateMedicalEquipmentWarrantyServices(
         .getByRole('textbox', { name: /w\s*\/\s*s|ws\s*value|value/i })
         .or(row.locator('input:not([disabled]):not([readonly])').nth(1))
         .first();
-      // Prefer last editable non-percent input as W/S
       const editables = row.locator('input:not([type="hidden"]):not([disabled])');
       const ec = await editables.count().catch(() => 0);
       let filled = false;
-      for (let i = 0; i < ec; i++) {
-        const inp = editables.nth(i);
-        const name =
-          ((await inp.getAttribute('aria-label').catch(() => '')) || '') +
-          ((await inp.getAttribute('name').catch(() => '')) || '');
-        if (/percent|rate|%/i.test(name)) continue;
-        await fillIfBlankOrZero(inp, CALC_WS_VALUE, `${spec.name} W/S Value`);
-        filled = true;
-        break;
-      }
-      if (!filled && (await wsInput.isVisible({ timeout: 0 }).catch(() => false))) {
-        await fillIfBlankOrZero(wsInput, CALC_WS_VALUE, `${spec.name} W/S Value`);
+      if (!skipEdits) {
+        for (let i = 0; i < ec; i++) {
+          const inp = editables.nth(i);
+          const name =
+            ((await inp.getAttribute('aria-label').catch(() => '')) || '') +
+            ((await inp.getAttribute('name').catch(() => '')) || '');
+          if (/percent|rate|%/i.test(name)) continue;
+          await fillIfBlankOrZero(inp, CALC_WS_VALUE, `${spec.name} W/S Value`);
+          filled = true;
+          break;
+        }
+        if (!filled && (await wsInput.isVisible({ timeout: 0 }).catch(() => false))) {
+          await fillIfBlankOrZero(wsInput, CALC_WS_VALUE, `${spec.name} W/S Value`);
+        }
       }
     } else {
       // Warranty: fill % ; W/S should be read-only / auto
@@ -12808,7 +13162,7 @@ async function fillAndValidateMedicalEquipmentWarrantyServices(
         .getByRole('textbox', { name: /percent|rate|%/i })
         .or(row.locator('input:not([disabled])').first())
         .first();
-      if (await rateInput.isVisible({ timeout: 0 }).catch(() => false)) {
+      if (!skipEdits && (await rateInput.isVisible({ timeout: 0 }).catch(() => false))) {
         await fillPercentIfBlank(rateInput, CALC_EW_RATE_PCT, `${spec.name} Percentage (%)`);
       }
       const wsReadonly = row.locator('input[readonly], input[disabled]').first();
@@ -12926,18 +13280,26 @@ async function fillAndValidateMedicalEquipmentWarrantyServices(
 }
 
 async function runMedicalEquipmentCalculatorValidation(page, validationRows, tag) {
-  const selling = await fillAndValidateMedicalEquipmentSellingPriceSection(page, validationRows, tag);
-  const supplier = await fillAndValidateMedicalEquipmentSupplierCostSection(page, selling.qty, validationRows, tag);
+  const skipEdits = await shouldSkipCalculatorEdits(page, tag);
+  if (skipEdits) {
+    await capHighProvisionChargeRates(page, tag, { onlyAbove100: true });
+  }
+
+  const fillOpts = { skipEdits };
+  const selling = await fillAndValidateMedicalEquipmentSellingPriceSection(page, validationRows, tag, fillOpts);
+  const supplier = await fillAndValidateMedicalEquipmentSupplierCostSection(page, selling.qty, validationRows, tag, fillOpts);
   const landed = await fillAndValidateMedicalEquipmentLandedCostSection(
     page,
     { totalSupplierPrice: supplier.totalSupplier, isSar: supplier.isSar },
     validationRows,
     tag,
+    fillOpts,
   );
 
   const warranty = await fillAndValidateMedicalEquipmentWarrantyServices(page, validationRows, tag, {
     totalSellingPriceAfterDiscount: selling.totalAfter,
     unitSalesPriceAfterDiscount: selling.unitAfter,
+    skipEdits,
   });
 
   // Do not force GP here yet — provisions/W/S still increase Project Cost
@@ -12950,7 +13312,7 @@ async function runMedicalEquipmentCalculatorValidation(page, validationRows, tag
 
   const provisions = await validateMedicalEquipmentProvisionCharges(
     page,
-    { totalSellingAfterDiscount: totalSelling, landedMaterialCost: landed.landed },
+    { totalSellingAfterDiscount: totalSelling, landedMaterialCost: landed.landed, skipEdits },
     validationRows,
     tag,
   );
@@ -13031,10 +13393,12 @@ async function runMedicalEquipmentCalculatorValidation(page, validationRows, tag
       : NaN;
 
   // Raise Unit Price / Qty only when we know GP would be ≤ 0 (use Profitability Summary screenshot fields)
-  const gpFix = await ensurePositiveGrossProfit(page, tag, {
-    selling: totalSelling,
-    project: formulaProject,
-  });
+  const gpFix = await ensurePositiveGrossProfit(
+    page,
+    tag,
+    { selling: totalSelling, project: formulaProject },
+    { skipEdits },
+  );
   if (Number.isFinite(gpFix?.selling)) totalSelling = gpFix.selling;
 
   // Re-read Selling after GP bump for Net Incl. VAT
@@ -13145,7 +13509,13 @@ async function runMedicalEquipmentCalculatorValidation(page, validationRows, tag
 }
 
 async function runConsumablesCalculatorValidation(page, validationRows, tag) {
-  const selling = await fillAndValidateConsumablesSellingPriceSection(page, validationRows, tag);
+  const skipEdits = await shouldSkipCalculatorEdits(page, tag);
+  if (skipEdits) {
+    await capHighProvisionChargeRates(page, tag, { onlyAbove100: true });
+  }
+  const fillOpts = { skipEdits };
+
+  const selling = await fillAndValidateConsumablesSellingPriceSection(page, validationRows, tag, fillOpts);
   const sellingAdjEarly = await readLabeledNumericMap(await pricingCalculatorRoot(page));
   let totalAfter = pickValue(
     sellingAdjEarly,
@@ -13176,10 +13546,12 @@ async function runConsumablesCalculatorValidation(page, validationRows, tag) {
   );
 
   // Raise Unit / Qty if GP% ≤ 0 (Project Cost = Landed Cost for Consumables)
-  const gpFix = await ensurePositiveGrossProfit(page, tag, {
-    selling: totalAfter,
-    project: Number.isFinite(landed.landed) ? landed.landed : NaN,
-  });
+  const gpFix = await ensurePositiveGrossProfit(
+    page,
+    tag,
+    { selling: totalAfter, project: Number.isFinite(landed.landed) ? landed.landed : NaN },
+    { skipEdits },
+  );
   if (Number.isFinite(gpFix?.selling)) totalAfter = gpFix.selling;
 
   const sellingAdj = await readLabeledNumericMap(await pricingCalculatorRoot(page));
@@ -13222,7 +13594,7 @@ async function runConsumablesCalculatorValidation(page, validationRows, tag) {
     {
       unitAfter: Number.isFinite(unitAfterAdj) ? unitAfterAdj : selling.unitAfter,
       qty: qtyAdj,
-      landedMaterialCost: landed.landed,
+      landedCost: landed.landed,
       totalSellingAfterDiscount: totalAfter,
     },
     validationRows,
@@ -13279,8 +13651,13 @@ async function runConsumablesCalculatorValidation(page, validationRows, tag) {
       gpAmount: snapGpAmt,
       gpPct: snapGpPct,
       landedCost: firstFinite(keyCheck.snapshot.landedCost, landed.landed),
-      landedMaterialCost: firstFinite(keyCheck.snapshot.landedMaterialCost, landed.landedMaterial),
+      landedMaterialCost: firstFinite(
+        keyCheck.snapshot.landedMaterialCost,
+        landed.landedMaterial,
+        supplier.totalSupplier,
+      ),
       totalSupplierPrice: firstFinite(keyCheck.snapshot.totalSupplierPrice, supplier.totalSupplier),
+      totalEk02: firstFinite(keyCheck.snapshot.totalEk02, provisionSum),
     },
     values: {
       ...selling.values,
@@ -14142,6 +14519,10 @@ async function configureAndValidateQuotePricing(page) {
   }
   let rows = await quoteLineItemRows(page);
   progress(`12. Quote has ${lineCount} Quote Line Item(s) — processing each`);
+  await waitForQuoteLineItemsToLoad(page, { attempts: 12, waitMs: 1_500 });
+  rows = await quoteLineItemRows(page);
+  const hydrated = await rows.count().catch(() => 0);
+  if (hydrated > 0) progress(`12. Lines grid hydrated — ${hydrated} product row(s) with Show Actions`);
 
   for (let i = 0; i < lineCount; i++) {
     const tag = `QLI#${i + 1}`;
@@ -14192,12 +14573,30 @@ async function configureAndValidateQuotePricing(page) {
     } else {
       calcRun = await runConsumablesCalculatorValidation(page, validationRows, tag);
     }
-    // Calculator section formulas must pass (Selling, Supplier, Landed, W/S, Provisions, Profitability)
-    allOk = calcRun.ok && allOk;
-    progress(`12. ${tag} calculator formula validation → ${calcRun.ok ? 'PASS' : 'FAIL'}`);
 
-    const calcSnapshot = calcRun.calcSnapshot;
-    const calcFieldMap = mergeCalcSnapshotIntoFieldMap(await captureCalculatorFieldMap(page), calcSnapshot);
+    // ── Phase 1: Pricing Calculator formulas must be correct first ──────────
+    allOk = calcRun.ok && allOk;
+    progress(`12. ${tag} Phase 1 — Pricing Calculator formula validation → ${calcRun.ok ? 'PASS' : 'FAIL'}`);
+
+    const calcSnapshot = calcRun.calcSnapshot || {};
+    // Capture live calculator UI values (for Phase 2 compare) only after Phase 1
+    let calcFieldMap = {};
+    if (calcRun.ok) {
+      progress(`12. ${tag} Phase 1 PASS — capture Pricing Calculator values for QLI compare`);
+      calcFieldMap = await captureCalculatorFieldMap(page);
+      // Fill any blanks from formula snapshot; never overwrite live UI with expected formula
+      calcFieldMap = mergeCalcSnapshotIntoFieldMap(calcFieldMap, calcSnapshot);
+    } else {
+      progress(
+        `12. ${tag} Phase 1 FAIL — skip Calculator↔QLI compare until Pricing Calculator formulas pass`,
+      );
+      validationRows.push({
+        section: `${tag} Phase 2 Calculator ↔ QLI compare`,
+        actual: 'skipped',
+        expected: 'run only after Phase 1 Pricing Calculator formulas PASS',
+        status: 'INFO',
+      });
+    }
     calcSnapshot.fieldMap = calcFieldMap;
     lineSnapshots.push(calcSnapshot);
     progress(
@@ -14210,9 +14609,11 @@ async function configureAndValidateQuotePricing(page) {
       await page.goto(`/lightning/r/Quote/${quoteId}/view`, { waitUntil: 'domcontentloaded' });
     }
     await waitForQuoteRecordVisible(page, { timeout: 45_000 });
-    // Calculator Save lands on Quote Details — QLI live on Lines (force switch)
-    progress('12. After Calculator Save — on Details; switch to Lines for QLI');
-    await clickQuoteStalePriceRefresh(page, { timeout: 20_000 });
+
+    // Always: Save → Refresh Quote → Open QLI → Refresh QLI (even if Phase 1 failed, keep UI consistent)
+    progress('12. After Calculator Save — Refresh Quote → Open QLI → Refresh QLI');
+    await refreshQuoteRecord(page);
+    await sleep(1_200);
     await openQuoteTab(page, 'Lines', { force: true });
     await waitForQuoteLineItemsToLoad(page, { attempts: 8, waitMs: 1_500 });
     await scrollQuoteLineItemsIntoView(page);
@@ -14222,7 +14623,8 @@ async function configureAndValidateQuotePricing(page) {
     await page.waitForURL(/QuoteLineItem|\/0QL/i, { timeout: 45_000 }).catch(() => {});
     await page.locator('.slds-spinner:visible').first().waitFor({ state: 'hidden', timeout: 45_000 }).catch(() => {});
 
-    const { map: qliFieldMap, access } = await captureQliRecordFieldMap(page);
+    await refreshQuoteLineItemRecord(page);
+    let { map: qliFieldMap, access } = await captureQliRecordFieldMap(page);
     for (const spec of QLI_PRICING_SECTION_RES) {
       const present = !!(access?.found && access.found[spec.key]);
       validationRows.push({
@@ -14232,8 +14634,24 @@ async function configureAndValidateQuotePricing(page) {
         status: present ? 'PASS' : 'INFO',
       });
     }
-    progress(`12. ${tag} validate fields that exist on BOTH Pricing Calculator and Quote Line Item`);
-    allOk = compareSharedCalculatorQliFields(tag, calcFieldMap, qliFieldMap, validationRows) && allOk;
+
+    // ── Phase 2: captured Calculator values must equal refreshed QLI ───────
+    if (calcRun.ok && Object.keys(calcFieldMap).length) {
+      progress(`12. ${tag} Phase 2 — compare captured Pricing Calculator values vs refreshed QLI`);
+      const qliCompare = await validateCalculatorVsQliWithRefresh(page, tag, calcFieldMap, validationRows, {
+        map: qliFieldMap,
+        access,
+        refreshed: true,
+      });
+      qliFieldMap = qliCompare.qliFieldMap;
+      access = qliCompare.access;
+      progress(
+        `12. ${tag} Phase 2 — Calculator ↔ QLI → ${qliCompare.ok ? 'PASS (same values)' : 'FAIL'}`,
+      );
+      allOk = qliCompare.ok && allOk;
+    } else {
+      progress(`12. ${tag} Phase 2 skipped — Pricing Calculator formulas not PASS`);
+    }
 
     const qliCore = {
       totalSellingAfterDiscount: pickValue(
@@ -14388,6 +14806,7 @@ async function configureAndValidateQuotePricing(page) {
 /**
  * Read Quote Lines tab rows for PDF Quotation Details comparison.
  * Returns [{ item, description, qty, unitPrice, totalPrice, raw }]
+ * Uses Playwright locators (shadow-DOM safe) — card.evaluate often sees 0 tables in LWC.
  */
 async function readQuoteLinesTabForPdfCompare(page) {
   await openQuoteTab(page, 'Lines', { force: true });
@@ -14404,80 +14823,84 @@ async function readQuoteLinesTabForPdfCompare(page) {
     .first();
   await card.waitFor({ state: 'visible', timeout: 30_000 }).catch(() => {});
 
-  const rows = await card
-    .evaluate((root) => {
-      const out = [];
-      const tables = root.querySelectorAll('table');
-      const parseMoney = (s) => {
-        const t = String(s || '')
-          .replace(/SAR|USD|EUR/gi, '')
-          .replace(/[^\d.,\-]/g, '')
-          .replace(/,/g, '');
-        const n = Number.parseFloat(t);
-        return Number.isFinite(n) ? n : NaN;
-      };
-      for (const table of tables) {
-        const headers = [...table.querySelectorAll('thead th, thead td, [role="columnheader"]')].map((h) =>
-          (h.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase(),
-        );
-        const col = (re) => headers.findIndex((h) => re.test(h));
-        const iItem = col(/^(item|product(\s*name)?|product\s*code|line\s*item)$/);
-        const iDesc = col(/description|product\s*name/);
-        const iQty = col(/^quantity$|^qty$/);
-        const iUnit = col(/unit\s*sales|sales\s*price|list\s*price|unit\s*price/);
-        const iTotal = col(/total\s*price|total\s*selling|subtotal|net\s*total/);
-        const bodyRows = table.querySelectorAll('tbody tr');
-        for (const tr of bodyRows) {
-          const cells = [...tr.querySelectorAll('td, th')].map((c) => (c.innerText || '').replace(/\s+/g, ' ').trim());
-          if (!cells.length) continue;
-          const links = [...tr.querySelectorAll('a')]
-            .map((a) => (a.innerText || '').replace(/\s+/g, ' ').trim())
-            .filter((t) => t && !/show|view all|^$/i.test(t));
-          const item =
-            (iItem >= 0 ? cells[iItem] : '') ||
-            links.find((t) => /[A-Z0-9]+-[A-Z0-9]+/i.test(t)) ||
-            links[0] ||
-            '';
-          const description = (iDesc >= 0 ? cells[iDesc] : '') || '';
-          const qty = iQty >= 0 ? parseMoney(cells[iQty]) : NaN;
-          const unitPrice = iUnit >= 0 ? parseMoney(cells[iUnit]) : NaN;
-          const totalPrice = iTotal >= 0 ? parseMoney(cells[iTotal]) : NaN;
-          const raw = cells.join(' | ');
-          if (!item && !Number.isFinite(totalPrice) && !Number.isFinite(qty)) continue;
-          if (/no items|nothing to see|get started/i.test(raw)) continue;
-          out.push({
-            item: item.slice(0, 120),
-            description: description.slice(0, 200),
-            qty,
-            unitPrice,
-            totalPrice,
-            raw: raw.slice(0, 240),
-          });
+  // Prefer real QLI rows (product / 0QL links / Show Actions) via shared helper
+  let trs = await quoteLineItemRows(page).catch(() => null);
+  let n = trs ? await trs.count().catch(() => 0) : 0;
+  if (n < 1) {
+    trs = card.locator('table tbody tr, [role="row"]').filter({
+      has: page.getByRole('button', { name: /show\s*actions/i }).or(page.locator('a[href*="/0QL"], a[href*="/01t"], a[href*="QuoteLineItem"]')),
+    });
+    n = await trs.count().catch(() => 0);
+  }
+  if (n < 1) {
+    // Last resort: any data row that is not empty-state
+    trs = card.locator('table tbody tr').filter({ hasNotText: /no items|nothing to see|get started|^$/i });
+    n = await trs.count().catch(() => 0);
+  }
+
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    const row = trs.nth(i);
+    const raw = ((await row.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    if (!raw || /no items|nothing to see|loading/i.test(raw)) continue;
+
+    const linkTexts = [];
+    const links = row.locator('a');
+    const linkN = await links.count().catch(() => 0);
+    for (let li = 0; li < Math.min(linkN, 6); li++) {
+      const t = ((await links.nth(li).innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+      if (t && !/show|view all|^edit$/i.test(t)) linkTexts.push(t);
+    }
+
+    const cells = [];
+    const tds = row.locator('td, [role="gridcell"]');
+    const tdN = await tds.count().catch(() => 0);
+    for (let c = 0; c < tdN; c++) {
+      cells.push(((await tds.nth(c).innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim());
+    }
+
+    const codes =
+      raw.match(/\b[A-Z]{1,6}-[A-Z0-9][A-Z0-9\-]*\b/g) ||
+      linkTexts.filter((t) => /[A-Z]{1,6}-[A-Z0-9]/i.test(t));
+    const item =
+      (codes && codes[0]) ||
+      linkTexts.find((t) => t.length > 1 && t.length < 80) ||
+      cells.find((c) => /[A-Z0-9]+-[A-Z0-9]+/i.test(c)) ||
+      cells.find((c) => c && !/^sar|^[\d.,]+$/i.test(c) && c.length < 60) ||
+      `QLI#${i + 1}`;
+
+    const moneyNums = [...raw.matchAll(/-?[\d,]+\.\d{2}/g)].map((m) => parseMoney(m[0])).filter((x) => Number.isFinite(x));
+    // Qty: prefer a small integer cell that is not a money amount
+    let qty = NaN;
+    for (const c of cells) {
+      if (/^-?\d+(?:\.\d+)?$/.test(c) && !/\.\d{2}$/.test(c)) {
+        const q = Number.parseFloat(c);
+        if (Number.isFinite(q) && q > 0 && q < 100000) {
+          qty = q;
+          break;
         }
       }
-      return out;
-    })
-    .catch(() => []);
-
-  if (!rows.length) {
-    // Fallback: row text via Playwright
-    const trs = card.locator('table tbody tr');
-    const n = await trs.count().catch(() => 0);
-    for (let i = 0; i < n; i++) {
-      const raw = ((await trs.nth(i).innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
-      if (!raw || /no items|nothing to see/i.test(raw)) continue;
-      const codes = raw.match(/\b[A-Z]{1,4}-[A-Z0-9][A-Z0-9\-]*\b/g) || [];
-      const nums = [...raw.matchAll(/-?[\d,]+\.\d{2}/g)].map((m) => parseMoney(m[0]));
-      const qtyMatch = raw.match(/\b(\d+(?:\.\d+)?)\b/);
-      rows.push({
-        item: codes[0] || raw.slice(0, 40),
-        description: '',
-        qty: qtyMatch ? Number.parseFloat(qtyMatch[1]) : NaN,
-        unitPrice: nums.length >= 2 ? nums[nums.length - 2] : nums[0],
-        totalPrice: nums.length ? nums[nums.length - 1] : NaN,
-        raw: raw.slice(0, 240),
-      });
     }
+    if (!Number.isFinite(qty)) {
+      const qm = raw.match(/(?:^|\s)(\d{1,5})(?:\s|$)/);
+      if (qm) qty = Number.parseFloat(qm[1]);
+    }
+
+    const unitPrice = moneyNums.length >= 2 ? moneyNums[moneyNums.length - 2] : moneyNums[0];
+    const totalPrice = moneyNums.length ? moneyNums[moneyNums.length - 1] : NaN;
+    const description =
+      linkTexts.find((t) => t !== item && t.length > 8) ||
+      cells.find((c) => c && c !== item && c.length > 8 && !/^[\d.,]+$/.test(c) && !/^sar/i.test(c)) ||
+      '';
+
+    rows.push({
+      item: String(item).slice(0, 120),
+      description: String(description).slice(0, 200),
+      qty,
+      unitPrice: Number.isFinite(unitPrice) ? unitPrice : NaN,
+      totalPrice: Number.isFinite(totalPrice) ? totalPrice : NaN,
+      raw: raw.slice(0, 240),
+    });
   }
 
   for (const r of rows) {
@@ -15357,8 +15780,36 @@ test.describe('Salesforce Lead to Quote (E2E)', () => {
       // Use activePage for the rest of the flow (alias as page in local scope)
       const page = activePage;
 
-    // Resume Quote only — Lines → Configure → validate → QLI → Quote Totals
+    // Resume Quote only — Lines → Configure → validate → QLI → Quote Totals (or PDF-only)
     if (RESUME_QUOTE_ID) {
+      if (PDF_ONLY) {
+        progress(`RESUME PDF ONLY — Quote ${RESUME_QUOTE_ID} → Generate PDF → Preview → validate vs Lines`);
+        await page.goto(`/lightning/r/Quote/${RESUME_QUOTE_ID}/view`, { waitUntil: 'domcontentloaded' });
+        await waitForQuoteRecordVisible(page, { timeout: 60_000 });
+        await clickQuoteStalePriceRefresh(page, { timeout: 15_000 }).catch(() => {});
+        await openQuoteTab(page, 'Lines', { force: true }).catch(() => {});
+        let qliCount = await countQuoteLineItems(page);
+        if (qliCount < 1) {
+          qliCount = await waitForQuoteLineItemsToLoad(page, { attempts: 6, waitMs: 1_500 });
+        }
+        if (qliCount < 1) {
+          throw new Error(
+            `PDF-only validation needs Quote Line Items, but Quote ${RESUME_QUOTE_ID} has QLI=0. ` +
+              `Pick a Quote with Total Price > 0 / Lines (n≥1) and set SF_QUOTE_ID.`,
+          );
+        }
+        progress(`13. Quote has QLI (${qliCount}) — proceed with Generate PDF validation`);
+        const linesExpected = await readQuoteLinesTabForPdfCompare(page);
+        if (!linesExpected.length) {
+          throw new Error(
+            `Quote ${RESUME_QUOTE_ID} heading shows QLI=${qliCount} but Lines rows could not be read for PDF compare.`,
+          );
+        }
+        progress(`13. Lines tab — ${linesExpected.length} QLI/product row(s) for PDF Quotation Details compare`);
+        await generateAndPreviewQuotePdf(page, { linesExpected, lineSnapshots: [], validationRows: [] });
+        progress(`Done (PDF only) — ${RESUME_QUOTE_ID}`);
+        return;
+      }
       progress(`RESUME — Quote ${RESUME_QUOTE_ID} → Lines → Pricing Calculator → validate`);
       await page.goto(`/lightning/r/Quote/${RESUME_QUOTE_ID}/view`, { waitUntil: 'domcontentloaded' });
       await waitForQuoteRecordVisible(page, { timeout: 60_000 });
